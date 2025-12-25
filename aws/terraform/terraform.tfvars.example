@@ -1,0 +1,182 @@
+# Example terraform.tfvars - Copy this to terraform.tfvars and customize
+
+# General Configuration
+aws_region  = "us-east-1"
+environment = "prod"
+
+# VPC Configuration
+vpc_cidr = "10.0.0.0/16"
+availability_zones = [
+  "us-east-1a",
+  "us-east-1b",
+  "us-east-1c"
+]
+
+# RDS Configuration
+rds_instance_class    = "db.t3.medium"
+rds_allocated_storage = 100
+rds_multi_az          = true
+rds_database_name     = "rcapipeline"
+rds_master_username   = "rcaadmin"
+
+# ElastiCache Configuration
+redis_node_type  = "cache.t3.micro"
+redis_num_nodes  = 1
+
+# Lambda Configuration - Adjust based on your workload
+lambda_functions = {
+  "pipeline-trigger" = {
+    memory_size = 512
+    timeout     = 30
+    handler     = "handler.trigger_handler"
+    runtime     = "python3.11"
+  }
+  "driver-analysis" = {
+    memory_size = 2048
+    timeout     = 300
+    handler     = "handler.driver_analysis_handler"
+    runtime     = "python3.11"
+  }
+  "quant-news-analysis" = {
+    memory_size = 1024
+    timeout     = 300
+    handler     = "handler.quant_news_handler"
+    runtime     = "python3.11"
+  }
+  "social-sentiment" = {
+    memory_size = 1024
+    timeout     = 300
+    handler     = "handler.social_sentiment_handler"
+    runtime     = "python3.11"
+  }
+  "merge-consolidate" = {
+    memory_size = 1024
+    timeout     = 60
+    handler     = "handler.merge_handler"
+    runtime     = "python3.11"
+  }
+  "generate-reports" = {
+    memory_size = 512
+    timeout     = 60
+    handler     = "handler.report_handler"
+    runtime     = "python3.11"
+  }
+  "authorizer" = {
+    memory_size = 256
+    timeout     = 10
+    handler     = "handler.authorizer_handler"
+    runtime     = "python3.11"
+  }
+  "job-status" = {
+    memory_size = 256
+    timeout     = 10
+    handler     = "handler.status_handler"
+    runtime     = "python3.11"
+  }
+}
+
+# ECS Configuration - Adjust based on your needs
+ecs_task_definitions = {
+  "advanced-quant" = {
+    cpu    = 2048   # 2 vCPU
+    memory = 4096   # 4 GB
+    image  = "rca-pipeline/advanced-quant:latest"
+  }
+  "nlg-generator" = {
+    cpu    = 4096   # 4 vCPU
+    memory = 8192   # 8 GB
+    image  = "rca-pipeline/nlg-generator:latest"
+  }
+}
+
+# API Gateway Configuration
+api_throttle_burst_limit = 100
+api_throttle_rate_limit  = 50
+
+# Cognito Configuration
+cognito_password_policy = {
+  minimum_length    = 12
+  require_lowercase = true
+  require_numbers   = true
+  require_symbols   = true
+  require_uppercase = true
+}
+
+cognito_email_configuration = {
+  email_sending_account = "COGNITO_DEFAULT"
+  source_arn            = ""
+}
+
+# SQS Configuration
+sqs_visibility_timeout = 900
+sqs_max_receive_count  = 3
+
+# CloudWatch Alarms
+cloudwatch_alarm_thresholds = {
+  "lambda-errors" = {
+    metric              = "Errors"
+    threshold           = 10
+    comparison_operator = "GreaterThanThreshold"
+    evaluation_periods  = 1
+  }
+  "lambda-duration" = {
+    metric              = "Duration"
+    threshold           = 30000
+    comparison_operator = "GreaterThanThreshold"
+    evaluation_periods  = 2
+  }
+  "step-function-failed" = {
+    metric              = "ExecutionsFailed"
+    threshold           = 5
+    comparison_operator = "GreaterThanThreshold"
+    evaluation_periods  = 1
+  }
+}
+
+# EventBridge Scheduled Rules (disabled by default)
+eventbridge_scheduled_rules = {
+  "daily-portfolio-check" = {
+    schedule_expression = "cron(0 9 ? * MON-FRI *)"  # 9 AM EST, weekdays
+    input = jsonencode({
+      tickers = "AAPL,MSFT,NVDA,AMZN,GOOGL"
+      period  = "1mo"
+    })
+    enabled = false  # Set to true to enable scheduled runs
+  }
+}
+
+# WAF Configuration
+waf_rate_limit = 2000  # Requests per 5 minutes per IP
+
+# TimeStream (Optional - for time-series data)
+enable_timestream         = false
+timestream_retention_period = 90
+
+# Notifications
+notification_emails = [
+  # "your-email@example.com",
+  # "alerts@example.com"
+]
+
+# S3 Lifecycle Rules
+s3_lifecycle_rules = [
+  {
+    id      = "archive-old-reports"
+    enabled = true
+    transitions = [
+      {
+        days          = 30
+        storage_class = "GLACIER"
+      }
+    ]
+    expiration = {
+      days = 365
+    }
+  }
+]
+
+# Additional Tags
+additional_tags = {
+  CostCenter = "Engineering"
+  Team       = "Data Science"
+}
