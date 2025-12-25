@@ -1,0 +1,36 @@
+# American Stocks Root Cause Analysis (RCA) — dependencies
+#
+# This repo is designed to run on Windows/macOS/Linux.
+# Some packages are optional and only needed for specific stages.
+
+# Core
+pandas>=2.0.0
+numpy>=1.24.0
+yfinance>=0.2.28
+requests>=2.31.0
+python-dateutil>=2.8.2
+tqdm>=4.65.0
+
+# Driver analysis / statistics
+scipy>=1.11.0
+statsmodels>=0.14.0
+
+# Advanced quantitative (optional but recommended)
+scikit-learn>=1.3.0
+arch>=6.2.0
+
+# Sentiment / NLG (optional)
+feedparser>=6.0.10
+transformers>=4.30.0
+sentencepiece>=0.1.99
+
+# Torch is large; install separately if you want FinBERT sentiment locally.
+# torch>=2.0.0
+
+# Technical indicators (optional)
+# ta-lib is tricky on Windows; prefer pandas-ta if you don't have ta-lib wheels.
+# TA-Lib
+pandas-ta>=0.3.14b
+
+# Helpful for plots if you add notebooks/visuals
+matplotlib>=3.7.0
