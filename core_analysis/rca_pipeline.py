@@ -502,7 +502,7 @@ def main() -> None:
     p.add_argument("--tickers", type=str, default="AAPL,MSFT,NVDA,AMZN,GOOGL")
     p.add_argument("--period", type=str, default="12mo")
     p.add_argument("--interval", type=str, default="1d")
-    p.add_argument("--max-news", type=int, default=12)
+    p.add_argument("--max-news", type=int, default=50)
     p.add_argument("--lookback-days", type=int, default=14)
     p.add_argument("--no-explanations", action="store_true", help="Skip writing explanations_rca_*.md")
     p.add_argument("--with-advanced-quant", action="store_true", help="Also run stock_picker_advanced_quantitative and write its CSV artifacts into outputs/")
