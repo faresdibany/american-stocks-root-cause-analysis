@@ -618,8 +618,10 @@ def abnormal_return_attribution(
     except Exception:
         return {"available": False, "reason": "benchmark_data_unavailable"}
 
-    # align on same index
-    aligned = pd.concat([ticker_rets, mkt.rename("mkt")], axis=1).dropna()
+    # align on same index - ensure ticker_rets has a name
+    ticker_rets_named = ticker_rets.copy()
+    ticker_rets_named.name = "ret"
+    aligned = pd.concat([ticker_rets_named, mkt.rename("mkt")], axis=1).dropna()
     if len(aligned) < 40:
         return {"available": False, "reason": "insufficient_overlap"}
 
