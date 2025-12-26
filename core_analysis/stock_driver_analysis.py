@@ -84,6 +84,8 @@ class DriverReport:
     jumps: List[Jump]
     event_attribution: Dict[str, Any]
     change_points: Dict[str, Any]
+    factor_model: Dict[str, Any]  # NEW: multi-factor attribution
+    per_jump_drivers: List[Dict[str, Any]]  # NEW: per-jump driver analysis
     notes: List[str]
 
 
@@ -133,9 +135,20 @@ def fetch_prices(
 
 
 def compute_returns(px: pd.Series) -> pd.Series:
-    rets = px.pct_change().dropna()
-    rets.name = "ret"
+    """Compute log returns (more suitable for factor models)."""
+    px = px.dropna()
+    rets = np.log(px).diff()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+    rets.name = getattr(px, "name", "ret")
     return rets
+
+
+def align_series(series: Dict[str, pd.Series]) -> pd.DataFrame:
+    """Inner-join multiple return series on date index."""
+    df = pd.concat(series, axis=1).dropna(how="any")
+    # Flatten columns if needed
+    df.columns = [c if isinstance(c, str) else str(c) for c in df.columns]
+    return df
 
 
 def decompose_trend(
@@ -361,6 +374,219 @@ def estimate_beta(x: pd.Series, y: pd.Series) -> float:
     return cov / vx
 
 
+# -----------------------------
+# Multi-factor attribution (NEW)
+# -----------------------------
+
+DEFAULT_FACTOR_TICKERS: Dict[str, str] = {
+    "market": "SPY",
+    "rates": "IEF",   # 7-10y Treasuries
+    "usd": "UUP",     # USD index ETF
+    "oil": "USO",     # oil proxy ETF
+    "vix": "VXX",     # volatility proxy
+}
+
+
+def fetch_factor_returns(
+    start: str,
+    end: str,
+    tickers: Dict[str, str],
+) -> Dict[str, pd.Series]:
+    """Fetch returns for a dict of factors -> ticker."""
+    out: Dict[str, pd.Series] = {}
+    for name, tkr in tickers.items():
+        try:
+            px = fetch_prices(tkr, start=start, end=end)
+            out[name] = compute_returns(px)
+        except Exception:
+            # Skip factors that can't be fetched
+            continue
+    return out
+
+
+def ridge_regression_betas(X: np.ndarray, y: np.ndarray, lam: float = 1e-4) -> Tuple[float, np.ndarray]:
+    """Ridge regression with intercept. Returns (alpha, betas)."""
+    # Add intercept
+    X1 = np.column_stack([np.ones(len(X)), X])
+    # Closed-form ridge: (X'X + lam*I)^-1 X'y
+    I = np.eye(X1.shape[1])
+    I[0, 0] = 0.0  # don't penalize intercept
+    A = X1.T @ X1 + lam * I
+    b = X1.T @ y
+    coef = np.linalg.solve(A, b)
+    alpha = float(coef[0])
+    betas = coef[1:]
+    return alpha, betas
+
+
+def factor_model_fit(
+    stock_rets: pd.Series,
+    factor_rets: Dict[str, pd.Series],
+    ridge_lambda: float = 1e-4,
+) -> Dict[str, Any]:
+    """Fit a linear factor model: stock ~ factors."""
+    if not factor_rets:
+        return {"available": False, "reason": "no_factors"}
+
+    df = align_series({"stock": stock_rets, **factor_rets})
+    if len(df) < 30:
+        return {"available": False, "reason": "insufficient_overlap", "n_obs": int(len(df))}
+
+    y = df["stock"].values.astype(float)
+    factor_names = [c for c in df.columns if c != "stock"]
+    X = df[factor_names].values.astype(float)
+
+    alpha, betas = ridge_regression_betas(X, y, lam=ridge_lambda)
+    # In-sample R^2
+    yhat = alpha + X @ betas
+    ss_res = float(np.sum((y - yhat) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    return {
+        "available": True,
+        "n_obs": int(len(df)),
+        "alpha": float(alpha),
+        "betas": {name: float(b) for name, b in zip(factor_names, betas)},
+        "r2": float(r2),
+        "factors": factor_names,
+    }
+
+
+def factor_contributions_on_date(
+    date: str,
+    factor_rets: Dict[str, pd.Series],
+    betas: Dict[str, float],
+) -> Dict[str, float]:
+    """Compute beta_k * r_k on a given date (best-effort)."""
+    d = pd.Timestamp(date)
+    out: Dict[str, float] = {}
+    for k, s in factor_rets.items():
+        if k not in betas:
+            continue
+        # Normalize index to date only
+        s2 = s.copy()
+        s2.index = pd.to_datetime(s2.index).normalize()
+        dn = d.normalize()
+        if dn in s2.index:
+            rk = float(s2.loc[dn])
+            out[k] = float(betas[k] * rk)
+    return out
+
+
+def extract_headline_keywords(
+    headlines: List[str],
+    top_k: int = 6,
+) -> List[str]:
+    """Tiny TF-IDF-like keyword extractor (no sklearn dependency)."""
+    import re
+    stop = {
+        "the", "a", "an", "and", "or", "to", "of", "in", "for", "on", "with", "at", "by",
+        "from", "is", "are", "was", "were", "be", "as", "its", "it", "this", "that",
+        "after", "before", "up", "down", "will", "says", "said", "report", "reports",
+        "update", "new", "shares", "stock", "company", "inc", "corp", "co"
+    }
+    docs = []
+    for h in headlines:
+        toks = [t.lower() for t in re.findall(r"[a-zA-Z0-9]+", h)]
+        toks = [t for t in toks if len(t) >= 3 and t not in stop]
+        docs.append(toks)
+
+    if not docs:
+        return []
+
+    # document frequency
+    df: Dict[str, int] = {}
+    for toks in docs:
+        for t in set(toks):
+            df[t] = df.get(t, 0) + 1
+
+    N = len(docs)
+    tf: Dict[str, float] = {}
+    for toks in docs:
+        for t in toks:
+            tf[t] = tf.get(t, 0.0) + 1.0
+
+    # TF-IDF-ish
+    scores: Dict[str, float] = {}
+    for t, tfv in tf.items():
+        idf = np.log((N + 1.0) / (df.get(t, 1) + 0.5))
+        scores[t] = float(tfv * idf)
+
+    top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+    return [t for t, _ in top]
+
+
+def classify_driver_for_jump(
+    jump: Jump,
+    near_earnings: bool,
+    contrib: Dict[str, float],
+    idio: float,
+    total_ret: float,
+    headline_keywords: List[str],
+) -> Dict[str, Any]:
+    """Heuristic driver classifier for a single jump day."""
+    # shares by absolute contribution
+    parts = {**contrib, "idiosyncratic": idio}
+    denom = sum(abs(v) for v in parts.values()) or 1.0
+    shares = {k: abs(v) / denom for k, v in parts.items()}
+
+    # primary component
+    primary = max(shares.items(), key=lambda kv: kv[1])[0]
+    primary_share = float(shares[primary])
+
+    # Label logic
+    label = "unknown"
+    if near_earnings and shares.get("idiosyncratic", 0.0) >= 0.45:
+        label = "earnings / company-specific"
+    elif primary == "sector":
+        label = "sector / industry"
+    elif primary == "market":
+        label = "broad market"
+    elif primary in ("rates", "vix"):
+        label = "macro (rates/vol)"
+    elif primary in ("usd",):
+        label = "macro (fx)"
+    elif primary in ("oil",):
+        label = "macro (commodities)"
+    elif primary == "idiosyncratic":
+        label = "company-specific / narrative"
+
+    # confidence proxy
+    confidence = min(0.95, max(0.25, primary_share))
+
+    return {
+        "date": jump.date,
+        "ret": float(total_ret),
+        "jump_z": float(jump.zscore),
+        "near_earnings": bool(near_earnings),
+        "contributions": {k: float(v) for k, v in contrib.items()},
+        "idiosyncratic": float(idio),
+        "abs_share": {k: float(v) for k, v in shares.items()},
+        "primary_component": primary,
+        "primary_share": float(primary_share),
+        "driver_label": label,
+        "confidence_proxy": float(confidence),
+        "headline_keywords": headline_keywords[:8],
+    }
+
+
+def _near_date(date: str, candidates: List[str], days: int = 2) -> bool:
+    """Check if date is near any candidate dates within N days."""
+    try:
+        d = pd.Timestamp(date)
+    except Exception:
+        return False
+    for c in candidates:
+        try:
+            ct = pd.Timestamp(c)
+        except Exception:
+            continue
+        if abs((d - ct).days) <= days:
+            return True
+    return False
+
+
 def fetch_benchmark_returns(
     start: str,
     end: str,
@@ -556,16 +782,29 @@ def build_driver_report(
     start: str,
     end: str,
     trend_method: str = "hp",
+    factor_tickers: Optional[Dict[str, str]] = None,
+    headlines_by_date: Optional[Dict[str, List[str]]] = None,
+    ridge_lambda: float = 1e-4,
 ) -> DriverReport:
+    """Build comprehensive driver report with factor attribution.
+    
+    Parameters
+    ----------
+    factor_tickers : dict, optional
+        Mapping of factor name -> ticker. Recommended keys:
+        market, sector, rates, usd, oil, vix
+    headlines_by_date : dict, optional
+        Mapping of ISO date -> list of headlines
+    """
     rets = compute_returns(px)
     trend, resid = decompose_trend(px, method=trend_method)
 
     jumps = detect_jumps(rets)
     regimes = detect_volatility_regimes(rets)
 
-    # Trend summary (simple)
-    trend_ret = float(px.iloc[-1] / px.iloc[0] - 1.0)
-    ann_ret = (1.0 + trend_ret) ** (252.0 / max(1.0, float(len(rets)))) - 1.0
+    # Trend summary
+    trend_ret = float(px.iloc[-1] / px.iloc[0] - 1.0) if len(px) >= 2 else float("nan")
+    ann_ret = (1.0 + trend_ret) ** (252.0 / max(1.0, float(len(rets)))) - 1.0 if np.isfinite(trend_ret) else float("nan")
 
     trend_summary = {
         "total_return": trend_ret,
@@ -574,24 +813,90 @@ def build_driver_report(
         "residual_std": float(resid.std(ddof=0)),
     }
 
-    # Change points / regime shifts (heuristic)
+    # Change points / regime shifts
     cps = detect_changepoints_pelt_like(rets)
 
-    # Event attribution: structured events + abnormal return study vs SPY
+    # Factor model (NEW)
+    ft = {**DEFAULT_FACTOR_TICKERS}
+    if factor_tickers:
+        ft.update({k: v for k, v in factor_tickers.items() if v})
+    
+    factor_rets: Dict[str, pd.Series] = {}
+    try:
+        factor_rets = fetch_factor_returns(start=start, end=end, tickers=ft)
+    except Exception:
+        factor_rets = {}
+
+    fm = factor_model_fit(rets, factor_rets, ridge_lambda=ridge_lambda) if factor_rets else {
+        "available": False,
+        "reason": "factor_fetch_failed_or_empty"
+    }
+
+    # Earnings dates
+    cal = earnings_calendar(ticker)
+    earnings_dates = cal.get("earnings_dates", []) if cal.get("available") else []
+
+    # Per-jump driver analysis (NEW)
+    per_jump: List[Dict[str, Any]] = []
+    rets_n = rets.copy()
+    rets_n.index = pd.to_datetime(rets_n.index).normalize()
+
+    for j in jumps:
+        dn = pd.Timestamp(j.date).normalize()
+        if dn not in rets_n.index:
+            continue
+        r_day = float(rets_n.loc[dn])
+
+        contrib = {}
+        idio = float("nan")
+        if fm.get("available"):
+            betas = fm["betas"]
+            # Normalize factor return indices
+            fr_norm = {k: s.copy() for k, s in factor_rets.items()}
+            for k, s in fr_norm.items():
+                s.index = pd.to_datetime(s.index).normalize()
+                fr_norm[k] = s
+            contrib = factor_contributions_on_date(j.date, fr_norm, betas)
+            idio = float(r_day - sum(contrib.values()))
+
+        near_e = _near_date(j.date, earnings_dates, days=2)
+
+        h = (headlines_by_date or {}).get(j.date, [])
+        kw = extract_headline_keywords(h, top_k=6) if h else []
+
+        per_jump.append(
+            classify_driver_for_jump(
+                jump=j,
+                near_earnings=near_e,
+                contrib=contrib,
+                idio=idio if np.isfinite(idio) else float(r_day),
+                total_ret=r_day,
+                headline_keywords=kw,
+            )
+        )
+
+    # Event attribution (original structure preserved for compatibility)
     event_attr = attribute_events(
         ticker,
         jumps,
-        news_headlines=None,
+        news_headlines=headlines_by_date,
         ticker_rets=rets,
         start=start,
         end=end,
     )
 
+    # Notes
     notes = []
     if len(jumps) == 0:
         notes.append("No significant jumps detected under current thresholds.")
     if len(regimes) == 0:
         notes.append("Not enough data to segment volatility regimes.")
+    if not fm.get("available"):
+        notes.append("Factor model unavailable; per-jump driver labels will be mostly heuristic.")
+    if not headlines_by_date:
+        notes.append("No headlines provided; narrative linkage limited to earnings proximity + factor attribution.")
+    if "sector" not in (factor_tickers or {}):
+        notes.append("No sector factor provided; consider passing a sector ETF (e.g., XLK/XLE/XLF) for better attribution.")
 
     return DriverReport(
         ticker=ticker,
@@ -603,6 +908,8 @@ def build_driver_report(
         jumps=jumps,
         event_attribution=event_attr,
         change_points=cps,
+        factor_model=fm,
+        per_jump_drivers=per_jump,
         notes=notes,
     )
 
@@ -616,6 +923,7 @@ def save_report(report: DriverReport, out_dir: str) -> str:
     # dataclasses inside dataclasses already converted except VolRegime/Jump lists
     payload["volatility_regimes"] = [asdict(v) for v in report.volatility_regimes]
     payload["jumps"] = [asdict(j) for j in report.jumps]
+    # factor_model and per_jump_drivers are already dicts/lists of dicts
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -629,21 +937,42 @@ def run_driver_analysis(
     end: str,
     out_dir: str,
     trend_method: str = "hp",
+    sector_etf: Optional[str] = None,
+    headlines_by_date: Optional[Dict[str, List[str]]] = None,
 ) -> str:
+    """Convenience wrapper for CLI usage.
+    
+    Parameters
+    ----------
+    sector_etf : str, optional
+        If provided, will be used as factor name 'sector' for better attribution
+    headlines_by_date : dict, optional
+        Mapping of ISO date -> list of headlines for keyword extraction
+    """
     px = fetch_prices(ticker, start=start, end=end)
-    report = build_driver_report(ticker, px, start=start, end=end, trend_method=trend_method)
+    factors = {"sector": sector_etf} if sector_etf else None
+    report = build_driver_report(
+        ticker,
+        px,
+        start=start,
+        end=end,
+        trend_method=trend_method,
+        factor_tickers=factors,
+        headlines_by_date=headlines_by_date,
+    )
     return save_report(report, out_dir=out_dir)
 
 
 if __name__ == "__main__":
     import argparse
 
-    p = argparse.ArgumentParser(description="Per-stock movement driver analysis")
+    p = argparse.ArgumentParser(description="Per-stock movement driver analysis with multi-factor attribution")
     p.add_argument("--ticker", required=True)
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--out-dir", default=os.path.join("..", "outputs"))
     p.add_argument("--trend-method", default="hp", choices=["hp", "stl", "ewm"])
+    p.add_argument("--sector-etf", default=None, help="Optional sector ETF ticker (e.g., XLK, XLE, XLF)")
     args = p.parse_args()
 
     out = run_driver_analysis(
@@ -652,5 +981,6 @@ if __name__ == "__main__":
         end=args.end,
         out_dir=args.out_dir,
         trend_method=args.trend_method,
+        sector_etf=args.sector_etf,
     )
     print(out)
