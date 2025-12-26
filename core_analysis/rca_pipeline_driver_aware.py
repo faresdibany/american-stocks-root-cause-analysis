@@ -538,9 +538,10 @@ def run_pipeline(
     # Optional: NLG stage (existing module)
     if with_nlg:
         try:
-            import stock_picker_nlg_explanations as nlg  # local module
+            # Driver-aware NLG module (mode-aware explanations + ModeAwareScore)
+            import stock_picker_nlg_explanations_driver_aware as nlg  # local module
 
-            # Use the advisor-style entrypoint which generates explanations and
+            # Use the driver-aware entrypoint which generates explanations and
             # returns the richer result dict (run_with_explanations).
             nlg_cfg = nlg.Config(
                 tickers=tickers,
@@ -553,12 +554,8 @@ def run_pipeline(
                 generate_explanations=True,
                 explanations_top_n=min(10, len(tickers)),
             )
-            # call the explicit run_with_explanations entrypoint (module defines this)
-            if hasattr(nlg, "run_with_explanations"):
-                nlg_out = nlg.run_with_explanations(nlg_cfg)
-            else:
-                # fallback for older modules that may export `run` (defensive)
-                nlg_out = getattr(nlg, "run", lambda cfg: {}) (nlg_cfg)
+            # driver-aware module defines run_with_explanations
+            nlg_out = nlg.run_with_explanations(nlg_cfg)
 
             ranked_nlg = nlg_out.get("ranked")
             portfolio_nlg = nlg_out.get("portfolio")
