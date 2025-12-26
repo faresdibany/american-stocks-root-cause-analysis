@@ -47,9 +47,16 @@ except Exception:  # pragma: no cover
 try:
     from statsmodels.tsa.seasonal import STL
     from statsmodels.tsa.filters.hp_filter import hpfilter
+    from statsmodels.tsa.stattools import grangercausalitytests
 except Exception:  # pragma: no cover
     STL = None
     hpfilter = None
+    grangercausalitytests = None
+
+try:
+    from sklearn.linear_model import Ridge as SklearnRidge
+except Exception:  # pragma: no cover
+    SklearnRidge = None
 
 
 # -----------------------------
@@ -84,8 +91,11 @@ class DriverReport:
     jumps: List[Jump]
     event_attribution: Dict[str, Any]
     change_points: Dict[str, Any]
-    factor_model: Dict[str, Any]  # NEW: multi-factor attribution
-    per_jump_drivers: List[Dict[str, Any]]  # NEW: per-jump driver analysis
+    factor_model: Dict[str, Any]  # Multi-factor attribution
+    per_jump_drivers: List[Dict[str, Any]]  # Per-jump driver analysis
+    granger_causality: Dict[str, Any]  # ENHANCEMENT 1: Temporal causation tests
+    causal_dag: Dict[str, Any]  # ENHANCEMENT 2: Causal network structure
+    rolling_betas: Dict[str, Any]  # ENHANCEMENT 3: Time-varying factor exposures
     notes: List[str]
 
 
@@ -712,6 +722,577 @@ def earnings_calendar(ticker: str) -> Dict[str, Any]:
         return {"available": False}
 
 
+# -----------------------------
+# ENHANCEMENT 1: Granger Causality Testing
+# -----------------------------
+
+
+def estimate_granger_causality(
+    ticker_rets: pd.Series,
+    factor_rets: Dict[str, pd.Series],
+    max_lag: int = 5,
+    alpha: float = 0.05,
+) -> Dict[str, Any]:
+    """Test if factors Granger-cause stock returns.
+    
+    Granger causality tests whether past values of factors help predict current stock returns
+    beyond what the stock's own past returns can predict. This captures *temporal* causation,
+    not just correlation.
+    
+    Parameters
+    ----------
+    ticker_rets : pd.Series
+        Stock return series
+    factor_rets : Dict[str, pd.Series]
+        Dictionary of factor name -> return series
+    max_lag : int, default 5
+        Maximum number of lags to test (typically 1-5 for daily data)
+    alpha : float, default 0.05
+        Significance level for hypothesis tests
+        
+    Returns
+    -------
+    Dict with:
+        - available: bool
+        - results: Dict[factor_name, Dict[str, float]] containing:
+            * p_value: minimum p-value across lags (lower = stronger causality)
+            * best_lag: lag with strongest causality
+            * causal: bool (True if p_value < alpha)
+        - summary: Dict with counts of causal factors
+        
+    Notes
+    -----
+    Requires statsmodels. Uses F-test for Granger causality.
+    Null hypothesis: Factor does NOT Granger-cause stock returns.
+    Low p-value -> reject null -> factor predicts stock returns.
+    
+    Example
+    -------
+    >>> gc_results = estimate_granger_causality(nvda_rets, {"VIX": vix_rets}, max_lag=3)
+    >>> if gc_results["results"]["VIX"]["causal"]:
+    ...     print(f"VIX predicts NVDA with lag {gc_results['results']['VIX']['best_lag']}")
+    """
+    if grangercausalitytests is None:
+        return {
+            "available": False,
+            "reason": "statsmodels.tsa.stattools.grangercausalitytests not available",
+        }
+    
+    if not factor_rets or len(ticker_rets) < max_lag * 10:
+        return {
+            "available": False,
+            "reason": "insufficient_data",
+            "n_obs": len(ticker_rets),
+        }
+    
+    results = {}
+    for factor_name, factor_series in factor_rets.items():
+        try:
+            # Align data
+            df = pd.concat([ticker_rets.rename("stock"), factor_series.rename("factor")], axis=1).dropna()
+            if len(df) < max_lag * 10:
+                results[factor_name] = {
+                    "p_value": 1.0,
+                    "best_lag": None,
+                    "causal": False,
+                    "error": "insufficient_overlap",
+                }
+                continue
+            
+            # Run Granger causality test
+            # Data format: [dependent, independent] = [stock, factor]
+            # Tests if factor Granger-causes stock
+            gc_res = grangercausalitytests(df[["stock", "factor"]], max_lag, verbose=False)
+            
+            # Extract p-values for each lag (using F-test)
+            p_values = {}
+            for lag in range(1, max_lag + 1):
+                # gc_res[lag] is tuple: (test_results_dict, ...)
+                # test_results_dict has keys: 'ssr_ftest', 'ssr_chi2test', 'lrtest', 'params_ftest'
+                # Each value is tuple: (statistic, p_value, df)
+                p_values[lag] = gc_res[lag][0]["ssr_ftest"][1]  # F-test p-value
+            
+            # Find best (lowest p-value) lag
+            best_lag = min(p_values.items(), key=lambda x: x[1])
+            
+            results[factor_name] = {
+                "p_value": float(best_lag[1]),
+                "best_lag": int(best_lag[0]),
+                "causal": bool(best_lag[1] < alpha),
+                "all_lags_p": {int(k): float(v) for k, v in p_values.items()},
+            }
+            
+        except Exception as e:
+            results[factor_name] = {
+                "p_value": 1.0,
+                "best_lag": None,
+                "causal": False,
+                "error": str(e)[:200],
+            }
+    
+    # Summary statistics
+    causal_factors = [k for k, v in results.items() if v.get("causal", False)]
+    
+    return {
+        "available": True,
+        "max_lag": max_lag,
+        "alpha": alpha,
+        "n_factors_tested": len(factor_rets),
+        "results": results,
+        "summary": {
+            "n_causal_factors": len(causal_factors),
+            "causal_factors": causal_factors,
+            "strongest_predictor": min(results.items(), key=lambda x: x[1].get("p_value", 1.0))[0] if results else None,
+        },
+    }
+
+
+# -----------------------------
+# ENHANCEMENT 2: Causal DAG Discovery
+# -----------------------------
+
+
+def build_causal_dag(
+    ticker_rets: pd.Series,
+    factor_rets: Dict[str, pd.Series],
+    alpha: float = 0.05,
+    max_cond_vars: int = 3,
+) -> Dict[str, Any]:
+    """Discover causal structure using PC algorithm (constraint-based causal inference).
+    
+    The PC algorithm learns a Directed Acyclic Graph (DAG) representing causal relationships
+    between the stock and factors. It can reveal:
+    - Direct causation: Factor A → Stock
+    - Indirect causation: Factor A → Factor B → Stock
+    - Common causes: Factor C → Factor A, Factor C → Stock
+    - Confounders and mediators
+    
+    Parameters
+    ----------
+    ticker_rets : pd.Series
+        Stock return series
+    factor_rets : Dict[str, pd.Series]
+        Dictionary of factor name -> return series
+    alpha : float, default 0.05
+        Significance level for conditional independence tests
+        (lower = more conservative, fewer edges)
+    max_cond_vars : int, default 3
+        Maximum number of conditioning variables in CI tests
+        (higher = more thorough but slower)
+        
+    Returns
+    -------
+    Dict with:
+        - available: bool
+        - nodes: List[str] - all variables in the graph
+        - edges: List[Tuple[str, str]] - directed edges (from, to)
+        - adjacency_matrix: 2D array - graph structure
+        - stock_parents: List[str] - direct causes of stock returns
+        - stock_children: List[str] - variables caused by stock returns
+        - interpretation: str - human-readable summary
+        
+    Notes
+    -----
+    Requires causallearn package: pip install causal-learn
+    Uses conditional independence tests (Fisher's Z for continuous data).
+    
+    Interpretation:
+    - A → B means A causes B (A comes before B in causal ordering)
+    - If Stock has parents [VIX, Market], these factors directly influence stock
+    - If Factor A → Factor B → Stock, Factor A has indirect influence through B
+    
+    Example
+    -------
+    >>> dag = build_causal_dag(nvda_rets, {"Market": spy_rets, "VIX": vix_rets})
+    >>> print(dag["stock_parents"])  # ['Market', 'VIX']
+    >>> print(dag["edges"])  # [('Market', 'NVDA'), ('VIX', 'Market')]
+    """
+    try:
+        from causallearn.search.ConstraintBased.PC import pc
+        from causallearn.utils.cit import fisherz
+    except ImportError:
+        return {
+            "available": False,
+            "reason": "causal-learn package not installed (pip install causal-learn)",
+        }
+    
+    if not factor_rets or len(ticker_rets) < 100:
+        return {
+            "available": False,
+            "reason": "insufficient_data",
+            "n_obs": len(ticker_rets),
+        }
+    
+    try:
+        # Align all data
+        data_dict = {"stock": ticker_rets, **factor_rets}
+        df = pd.concat(data_dict, axis=1).dropna()
+        
+        if len(df) < 100:
+            return {
+                "available": False,
+                "reason": "insufficient_overlap_after_alignment",
+                "n_obs": len(df),
+            }
+        
+        # Run PC algorithm
+        # Returns CausalGraph object with:
+        # - G.graph: adjacency matrix (0=no edge, 1=edge with →, -1=edge with ←)
+        # - G.nodes: node names
+        cg = pc(
+            df.values,
+            alpha=alpha,
+            indep_test=fisherz,
+            stable=True,  # More stable variable ordering
+            uc_rule=0,  # Conservative orientation rules
+            uc_priority=2,
+            mvpc=False,
+            correction_name="MV_Crtn_Fisher_Z",
+            background_knowledge=None,
+            verbose=False,
+            show_progress=False,
+        )
+        
+        # Extract graph structure
+        nodes = list(df.columns)
+        graph_matrix = cg.G.graph  # n x n array
+        
+        # Extract directed edges
+        edges = []
+        for i in range(len(nodes)):
+            for j in range(len(nodes)):
+                if graph_matrix[i, j] == 1 and graph_matrix[j, i] == -1:
+                    # i → j
+                    edges.append((nodes[i], nodes[j]))
+                elif graph_matrix[i, j] == -1 and graph_matrix[j, i] == 1:
+                    # j → i
+                    edges.append((nodes[j], nodes[i]))
+                elif graph_matrix[i, j] == 1 and graph_matrix[j, i] == 1:
+                    # Undirected edge (couldn't orient)
+                    edges.append((nodes[i], nodes[j]))
+        
+        # Find stock's parents and children
+        stock_idx = nodes.index("stock")
+        stock_parents = []
+        stock_children = []
+        
+        for i, node in enumerate(nodes):
+            if i == stock_idx:
+                continue
+            
+            # Check if node → stock
+            if graph_matrix[i, stock_idx] == 1 and graph_matrix[stock_idx, i] == -1:
+                stock_parents.append(node)
+            # Check if stock → node
+            elif graph_matrix[stock_idx, i] == 1 and graph_matrix[i, stock_idx] == -1:
+                stock_children.append(node)
+        
+        # Generate interpretation
+        if stock_parents:
+            interpretation = f"Stock returns are directly influenced by: {', '.join(stock_parents)}. "
+        else:
+            interpretation = "No direct causal influences detected on stock returns. "
+        
+        if stock_children:
+            interpretation += f"Stock returns directly influence: {', '.join(stock_children)}. "
+        
+        # Detect indirect paths
+        indirect_influences = []
+        for parent in stock_parents:
+            parent_idx = nodes.index(parent)
+            for i, node in enumerate(nodes):
+                if i != parent_idx and i != stock_idx and node not in stock_parents:
+                    # Check if node → parent
+                    if graph_matrix[i, parent_idx] == 1 and graph_matrix[parent_idx, i] == -1:
+                        indirect_influences.append(f"{node} → {parent} → stock")
+        
+        if indirect_influences:
+            interpretation += f"Indirect influences: {'; '.join(indirect_influences[:3])}."
+        
+        return {
+            "available": True,
+            "algorithm": "PC (constraint-based)",
+            "alpha": alpha,
+            "n_nodes": len(nodes),
+            "n_edges": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+            "adjacency_matrix": graph_matrix.tolist(),
+            "stock_parents": stock_parents,
+            "stock_children": stock_children,
+            "interpretation": interpretation,
+        }
+        
+    except Exception as e:
+        return {
+            "available": False,
+            "reason": f"causal_dag_error: {str(e)[:300]}",
+        }
+
+
+# -----------------------------
+# ENHANCEMENT 3: Rolling Factor Betas (Time-Varying Exposures)
+# -----------------------------
+
+
+def rolling_factor_betas(
+    ticker_rets: pd.Series,
+    factor_rets: Dict[str, pd.Series],
+    window: int = 60,
+    ridge_alpha: float = 1.0,
+    min_periods: int = 30,
+) -> Dict[str, Any]:
+    """Compute time-varying factor exposures using rolling window regression.
+    
+    Standard factor models assume constant betas, but in reality:
+    - Factor exposures change with business cycles
+    - Companies shift strategies (e.g., more/less leverage → different rate sensitivity)
+    - Market regimes affect factor loadings
+    
+    This function estimates how factor betas evolve over time, revealing:
+    - Regime-dependent relationships
+    - Structural breaks in factor exposure
+    - Time periods of high/low factor sensitivity
+    
+    Parameters
+    ----------
+    ticker_rets : pd.Series
+        Stock return series
+    factor_rets : Dict[str, pd.Series]
+        Dictionary of factor name -> return series
+    window : int, default 60
+        Rolling window size in days (60 ≈ 3 months for daily data)
+    ridge_alpha : float, default 1.0
+        Ridge regression penalty (reduces overfitting with multiple factors)
+    min_periods : int, default 30
+        Minimum observations required for estimation
+        
+    Returns
+    -------
+    Dict with:
+        - available: bool
+        - window_days: int
+        - factor_names: List[str]
+        - time_series: List[Dict] - each dict has:
+            * date: str
+            * betas: Dict[factor_name, float]
+            * r2: float (in-sample fit)
+        - summary_stats: Dict[factor_name, Dict] containing:
+            * mean_beta: float
+            * std_beta: float
+            * min_beta: float
+            * max_beta: float
+            * cv: float (coefficient of variation = std/mean)
+        - regime_changes: List[Dict] - detected significant beta shifts
+        
+    Notes
+    -----
+    Uses Ridge regression to handle multicollinearity when multiple factors are correlated.
+    Higher window = smoother estimates but slower to detect changes.
+    Lower window = more responsive but noisier.
+    
+    Interpretation:
+    - High CV (std/mean) = factor exposure varies a lot over time
+    - Regime changes = dates when betas shift significantly (> 1.5 std)
+    - Increasing VIX beta over time = stock becoming more sensitive to volatility
+    
+    Example
+    -------
+    >>> rolling = rolling_factor_betas(nvda_rets, {"Market": spy_rets, "VIX": vix_rets}, window=60)
+    >>> market_betas = [d["betas"]["Market"] for d in rolling["time_series"]]
+    >>> plt.plot(market_betas)  # Visualize how market beta changes over time
+    """
+    if not factor_rets or len(ticker_rets) < window + min_periods:
+        return {
+            "available": False,
+            "reason": "insufficient_data",
+            "n_obs": len(ticker_rets),
+            "required": window + min_periods,
+        }
+    
+    # Align data
+    data_dict = {"stock": ticker_rets, **factor_rets}
+    df = pd.concat(data_dict, axis=1).dropna()
+    
+    if len(df) < window + min_periods:
+        return {
+            "available": False,
+            "reason": "insufficient_overlap_after_alignment",
+            "n_obs": len(df),
+        }
+    
+    factor_names = [col for col in df.columns if col != "stock"]
+    
+    # Rolling regression
+    betas_ts = []
+    
+    try:
+        if SklearnRidge is not None:
+            # Use sklearn Ridge if available (faster)
+            for i in range(window, len(df)):
+                window_data = df.iloc[i - window : i]
+                
+                if len(window_data) < min_periods:
+                    continue
+                
+                y = window_data["stock"].values
+                X = window_data[factor_names].values
+                
+                # Ridge regression
+                model = SklearnRidge(alpha=ridge_alpha)
+                model.fit(X, y)
+                
+                # In-sample R²
+                y_pred = model.predict(X)
+                ss_res = np.sum((y - y_pred) ** 2)
+                ss_tot = np.sum((y - np.mean(y)) ** 2)
+                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+                
+                betas_ts.append({
+                    "date": df.index[i].date().isoformat(),
+                    "betas": {name: float(beta) for name, beta in zip(factor_names, model.coef_)},
+                    "r2": float(r2),
+                })
+        else:
+            # Fallback to numpy implementation
+            for i in range(window, len(df)):
+                window_data = df.iloc[i - window : i]
+                
+                if len(window_data) < min_periods:
+                    continue
+                
+                y = window_data["stock"].values
+                X = window_data[factor_names].values
+                
+                # Ridge regression (closed form)
+                _, betas = ridge_regression_betas(X, y, lam=ridge_alpha)
+                
+                # In-sample R²
+                y_pred = X @ betas
+                ss_res = np.sum((y - y_pred) ** 2)
+                ss_tot = np.sum((y - np.mean(y)) ** 2)
+                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+                
+                betas_ts.append({
+                    "date": df.index[i].date().isoformat(),
+                    "betas": {name: float(beta) for name, beta in zip(factor_names, betas)},
+                    "r2": float(r2),
+                })
+        
+        # Summary statistics for each factor
+        summary_stats = {}
+        for factor_name in factor_names:
+            beta_series = np.array([d["betas"][factor_name] for d in betas_ts])
+            
+            mean_beta = float(np.mean(beta_series))
+            std_beta = float(np.std(beta_series, ddof=1))
+            min_beta = float(np.min(beta_series))
+            max_beta = float(np.max(beta_series))
+            cv = float(abs(std_beta / mean_beta)) if mean_beta != 0 else float("inf")
+            
+            summary_stats[factor_name] = {
+                "mean_beta": mean_beta,
+                "std_beta": std_beta,
+                "min_beta": min_beta,
+                "max_beta": max_beta,
+                "coefficient_of_variation": cv,
+            }
+        
+        # Detect regime changes (significant beta shifts > 1.5 std)
+        regime_changes = []
+        for factor_name in factor_names:
+            beta_series = np.array([d["betas"][factor_name] for d in betas_ts])
+            dates = [d["date"] for d in betas_ts]
+            
+            mean_beta = summary_stats[factor_name]["mean_beta"]
+            std_beta = summary_stats[factor_name]["std_beta"]
+            
+            # Find points where beta crosses mean ± 1.5*std
+            threshold = 1.5 * std_beta
+            
+            for i in range(1, len(beta_series)):
+                prev_beta = beta_series[i - 1]
+                curr_beta = beta_series[i]
+                
+                # Check for significant shift
+                if abs(curr_beta - prev_beta) > threshold:
+                    regime_changes.append({
+                        "date": dates[i],
+                        "factor": factor_name,
+                        "beta_before": float(prev_beta),
+                        "beta_after": float(curr_beta),
+                        "shift_magnitude": float(curr_beta - prev_beta),
+                        "shift_in_std": float((curr_beta - prev_beta) / std_beta) if std_beta > 0 else 0.0,
+                    })
+        
+        # Sort regime changes by date
+        regime_changes.sort(key=lambda x: x["date"], reverse=True)
+        
+        return {
+            "available": True,
+            "window_days": window,
+            "ridge_alpha": ridge_alpha,
+            "n_observations": len(betas_ts),
+            "factor_names": factor_names,
+            "time_series": betas_ts,  # Full time series (can be large)
+            "summary_stats": summary_stats,
+            "regime_changes": regime_changes[:20],  # Top 20 most recent changes
+            "interpretation": _interpret_rolling_betas(summary_stats, regime_changes),
+        }
+        
+    except Exception as e:
+        return {
+            "available": False,
+            "reason": f"rolling_betas_error: {str(e)[:300]}",
+        }
+
+
+def _interpret_rolling_betas(
+    summary_stats: Dict[str, Dict[str, float]],
+    regime_changes: List[Dict[str, Any]],
+) -> str:
+    """Generate human-readable interpretation of rolling beta results."""
+    if not summary_stats:
+        return "No factor exposures estimated."
+    
+    # Find most stable and most variable factors
+    stable_factors = sorted(
+        summary_stats.items(),
+        key=lambda x: x[1]["coefficient_of_variation"]
+    )[:2]
+    
+    variable_factors = sorted(
+        summary_stats.items(),
+        key=lambda x: x[1]["coefficient_of_variation"],
+        reverse=True
+    )[:2]
+    
+    interpretation = ""
+    
+    if stable_factors:
+        interpretation += f"Most stable exposures: "
+        interpretation += ", ".join([f"{name} (β≈{stats['mean_beta']:.2f}, CV={stats['coefficient_of_variation']:.2f})"
+                                    for name, stats in stable_factors])
+        interpretation += ". "
+    
+    if variable_factors and variable_factors[0][1]["coefficient_of_variation"] > 0.3:
+        interpretation += f"Time-varying exposures: "
+        interpretation += ", ".join([f"{name} (β={stats['mean_beta']:.2f}±{stats['std_beta']:.2f}, CV={stats['coefficient_of_variation']:.2f})"
+                                    for name, stats in variable_factors])
+        interpretation += ". "
+    
+    if regime_changes:
+        n_changes = len(regime_changes)
+        interpretation += f"Detected {n_changes} significant regime shifts in factor exposures. "
+        
+        # Mention most recent major shift
+        if regime_changes:
+            recent = regime_changes[0]
+            interpretation += f"Most recent: {recent['factor']} beta shifted from {recent['beta_before']:.2f} to {recent['beta_after']:.2f} on {recent['date']}."
+    
+    return interpretation
+
+
 def attribute_events(
     ticker: str,
     jumps: List[Jump],
@@ -877,6 +1458,31 @@ def build_driver_report(
             )
         )
 
+    # ENHANCEMENT 1: Granger causality testing (temporal causation)
+    gc_results = estimate_granger_causality(
+        ticker_rets=rets,
+        factor_rets=factor_rets,
+        max_lag=5,
+        alpha=0.05,
+    ) if factor_rets else {"available": False, "reason": "no_factors"}
+
+    # ENHANCEMENT 2: Causal DAG discovery (causal network structure)
+    dag_results = build_causal_dag(
+        ticker_rets=rets,
+        factor_rets=factor_rets,
+        alpha=0.05,
+        max_cond_vars=3,
+    ) if factor_rets and len(rets) >= 100 else {"available": False, "reason": "insufficient_data"}
+
+    # ENHANCEMENT 3: Rolling factor betas (time-varying exposures)
+    rolling_results = rolling_factor_betas(
+        ticker_rets=rets,
+        factor_rets=factor_rets,
+        window=60,
+        ridge_alpha=1.0,
+        min_periods=30,
+    ) if factor_rets and len(rets) >= 90 else {"available": False, "reason": "insufficient_data"}
+
     # Event attribution (original structure preserved for compatibility)
     event_attr = attribute_events(
         ticker,
@@ -899,6 +1505,22 @@ def build_driver_report(
         notes.append("No headlines provided; narrative linkage limited to earnings proximity + factor attribution.")
     if "sector" not in (factor_tickers or {}):
         notes.append("No sector factor provided; consider passing a sector ETF (e.g., XLK/XLE/XLF) for better attribution.")
+    
+    # Notes for enhancements
+    if gc_results.get("available"):
+        causal = gc_results["summary"]["causal_factors"]
+        if causal:
+            notes.append(f"Granger causality detected: {', '.join(causal)} predict stock returns with temporal lag.")
+    
+    if dag_results.get("available"):
+        parents = dag_results.get("stock_parents", [])
+        if parents:
+            notes.append(f"Causal DAG analysis: Stock returns directly influenced by {', '.join(parents)}.")
+    
+    if rolling_results.get("available"):
+        n_changes = len(rolling_results.get("regime_changes", []))
+        if n_changes > 0:
+            notes.append(f"Time-varying factor exposures detected: {n_changes} significant regime shifts in betas.")
 
     return DriverReport(
         ticker=ticker,
@@ -912,6 +1534,9 @@ def build_driver_report(
         change_points=cps,
         factor_model=fm,
         per_jump_drivers=per_jump,
+        granger_causality=gc_results,
+        causal_dag=dag_results,
+        rolling_betas=rolling_results,
         notes=notes,
     )
 
