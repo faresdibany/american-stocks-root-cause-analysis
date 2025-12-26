@@ -39,8 +39,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from providers import (
+    NotConfiguredProviderError,
+    NullPriceProvider,
+    PriceProvider,
+    StrictnessPolicy,
+)
+
 try:
-    import yfinance as yf
+    import yfinance as yf  # optional fallback for local dev only
 except Exception:  # pragma: no cover
     yf = None
 
@@ -107,8 +114,43 @@ class DriverReport:
 def _require_yfinance() -> None:
     if yf is None:
         raise RuntimeError(
-            "yfinance is required. Install it (see requirements.txt) and try again."
+            "yfinance is required for the fallback price loader, but it is not installed. "
+            "In institutional deployments you should configure a PriceProvider."
         )
+
+
+def _normalize_price_series(px: Any, *, ticker: str) -> pd.Series:
+    """Normalize various provider/yfinance shapes into a clean 1D float Series."""
+    if px is None:
+        raise RuntimeError(f"No price data returned for {ticker}")
+
+    # Provider might already return a Series.
+    if isinstance(px, pd.Series):
+        s = px.copy()
+    elif isinstance(px, pd.DataFrame):
+        # Prefer common column names
+        for col in ("Adj Close", "adj_close", "adjusted_close", "Close", "close"):
+            if col in px.columns:
+                s = px[col].copy()
+                break
+        else:
+            # best-effort: take first numeric column
+            num = px.select_dtypes(include=["number"])
+            if num.shape[1] == 0:
+                raise RuntimeError(f"Price data for {ticker} had no numeric columns")
+            s = num.iloc[:, 0].copy()
+    else:
+        # Try array-like
+        try:
+            s = pd.Series(px)
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(f"Unrecognized price data type for {ticker}: {type(px)}") from e
+
+    s = s.dropna().astype(float)
+    s.name = "price"
+    if len(s) == 0:
+        raise RuntimeError(f"No usable price data after cleaning for {ticker}")
+    return s
 
 
 def fetch_prices(
@@ -116,32 +158,48 @@ def fetch_prices(
     start: str,
     end: str,
     interval: str = "1d",
+    *,
+    price_provider: Optional[PriceProvider] = None,
+    strictness: Optional[StrictnessPolicy] = None,
+    allow_yfinance_fallback: bool = False,
 ) -> pd.Series:
-    """Fetch adjusted close prices."""
-    _require_yfinance()
+    """Fetch adjusted close prices.
 
-    df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
-    if df is None or len(df) == 0:
-        raise RuntimeError(f"No data returned for {ticker}")
+    Institutional default: require an injected PriceProvider.
+    Optional dev fallback: allow_yfinance_fallback=True.
+    """
+    strictness = strictness or StrictnessPolicy()
 
-    # Prefer Adj Close when present
-    if "Adj Close" in df.columns:
-        px = df["Adj Close"].copy()
-    else:
-        px = df["Close"].copy()
+    if price_provider is not None:
+        try:
+            px = price_provider.get_adjusted_close(
+                ticker=ticker,
+                start=start,
+                end=end,
+                interval=interval,
+            )
+            return _normalize_price_series(px, ticker=ticker)
+        except Exception:
+            if strictness.fail_on_missing_prices:
+                raise
+            # fall through on non-strict mode
 
-    # yfinance can return a DataFrame with multiple columns (e.g., when using auto_adjust
-    # or multi-index columns depending on version). Ensure 1D Series.
-    if isinstance(px, pd.DataFrame):
-        if px.shape[1] == 1:
-            px = px.iloc[:, 0]
-        else:
-            # best-effort: pick the first numeric column
-            px = px.select_dtypes(include=["number"]).iloc[:, 0]
+    if allow_yfinance_fallback:
+        _require_yfinance()
+        df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
+        if df is None or len(df) == 0:
+            if strictness.fail_on_missing_prices:
+                raise RuntimeError(f"No data returned for {ticker}")
+            return pd.Series(dtype=float, name="price")
+        return _normalize_price_series(df, ticker=ticker)
 
-    px = px.dropna().astype(float)
-    px.name = "price"
-    return px
+    # No provider and fallback not allowed
+    if strictness.fail_on_missing_prices:
+        raise NotConfiguredProviderError(
+            "Institutional pipeline requires a PriceProvider. "
+            "Pass price_provider=... or set allow_yfinance_fallback=True for local/dev only."
+        )
+    return pd.Series(dtype=float, name="price")
 
 
 def compute_returns(px: pd.Series) -> pd.Series:
@@ -1558,7 +1616,6 @@ def save_report(report: DriverReport, out_dir: str) -> str:
     return out_path
 
 
-# in stock_driver_analysis.py
 def run_driver_analysis(
     ticker: str,
     start: str,
@@ -1567,24 +1624,25 @@ def run_driver_analysis(
     trend_method: str = "hp",
     sector_etf: Optional[str] = None,
     headlines_by_date: Optional[Dict[str, List[str]]] = None,
-    factor_tickers: Optional[Dict[str, str]] = None,   # <-- ADD THIS
 ) -> str:
+    """Convenience wrapper for CLI usage.
+    
+    Parameters
+    ----------
+    sector_etf : str, optional
+        If provided, will be used as factor name 'sector' for better attribution
+    headlines_by_date : dict, optional
+        Mapping of ISO date -> list of headlines for keyword extraction
+    """
     px = fetch_prices(ticker, start=start, end=end)
-
-    # Merge factor dictionaries:
-    merged = {}
-    if factor_tickers:
-        merged.update({k: v for k, v in factor_tickers.items() if v})
-    if sector_etf:
-        merged["sector"] = sector_etf
-
+    factors = {"sector": sector_etf} if sector_etf else None
     report = build_driver_report(
         ticker,
         px,
         start=start,
         end=end,
         trend_method=trend_method,
-        factor_tickers=merged if merged else None,        # <-- USE MERGED
+        factor_tickers=factors,
         headlines_by_date=headlines_by_date,
     )
     return save_report(report, out_dir=out_dir)

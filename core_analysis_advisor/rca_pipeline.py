@@ -33,8 +33,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import platform
+import subprocess
+import sys
 from datetime import datetime
+from dataclasses import dataclass
 from typing import Dict, List, Any
 
 import pandas as pd
@@ -50,6 +55,146 @@ import stock_picker_social_sentiment as social_picker
 # to avoid heavy imports (statsmodels/arch/talib/transformers/sklearn) unless requested.
 
 
+# -----------------------------------------------------------------------------
+# Advisor tooling additions
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class ClientConstraints:
+    """Client-specific constraints (advisor tooling).
+
+    This is a lightweight, practical definition intended for retail-advisor use.
+    In a production advisor product, you'd likely store this in a DB and validate it
+    with a schema layer.
+    """
+
+    # Risk constraints
+    max_drawdown: float | None = None  # e.g. -0.30 means max drawdown must be >= -30%
+
+    # Preferences / exclusions
+    require_dividends: bool = False
+    min_dividend_yield: float | None = None  # e.g. 0.02 for 2%
+    exclude_sectors: List[str] | None = None
+
+    # Diversification controls (soft enforcement in this pipeline)
+    max_sector_fraction_in_top: float | None = None  # e.g. 0.4 means at most 40% of top-N
+
+
+def _normalize_sector(s: str) -> str:
+    return (s or "").strip().lower().replace("&", "and")
+
+
+def _apply_constraints_to_ranked(
+    ranked: pd.DataFrame,
+    constraints: ClientConstraints,
+    top_n: int,
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    """Apply simple constraints to the ranked dataframe.
+
+    This is intentionally conservative and "explainable": we filter only when we have
+    a clear signal (e.g., max drawdown present). Otherwise we keep items and flag
+    missing data in the compliance report.
+    """
+    compliance: Dict[str, Any] = {
+        "available": True,
+        "top_n": int(top_n),
+        "constraints": {
+            "max_drawdown": constraints.max_drawdown,
+            "require_dividends": constraints.require_dividends,
+            "min_dividend_yield": constraints.min_dividend_yield,
+            "exclude_sectors": constraints.exclude_sectors or [],
+            "max_sector_fraction_in_top": constraints.max_sector_fraction_in_top,
+        },
+        "excluded": [],
+        "warnings": [],
+    }
+
+    df = ranked.copy()
+
+    # 1) Max drawdown hard filter (if column exists)
+    if constraints.max_drawdown is not None:
+        dd_cols = [c for c in df.columns if str(c).lower() in {"maxdd", "max_drawdown", "maxdd_pct"}]
+        if dd_cols:
+            c = dd_cols[0]
+            keep = df[c].astype(float) >= float(constraints.max_drawdown)
+            excluded = df.loc[~keep].index.tolist()
+            for t in excluded:
+                compliance["excluded"].append({"ticker": t, "reason": "max_drawdown", "value": float(df.loc[t, c])})
+            df = df.loc[keep]
+        else:
+            compliance["warnings"].append("max_drawdown constraint requested but no drawdown column found.")
+
+    # 2) Dividend preference (best-effort).
+    # We only enforce if a dividend yield column exists.
+    if constraints.require_dividends or constraints.min_dividend_yield is not None:
+        dy_cols = [c for c in df.columns if str(c).lower() in {"dividend_yield", "div_yield", "yield"}]
+        if dy_cols:
+            c = dy_cols[0]
+            dy = df[c].astype(float)
+            min_y = 0.0
+            if constraints.require_dividends:
+                min_y = max(min_y, 1e-9)
+            if constraints.min_dividend_yield is not None:
+                min_y = max(min_y, float(constraints.min_dividend_yield))
+            keep = dy >= min_y
+            excluded = df.loc[~keep].index.tolist()
+            for t in excluded:
+                compliance["excluded"].append({"ticker": t, "reason": "dividend_yield", "value": float(df.loc[t, c])})
+            df = df.loc[keep]
+        else:
+            compliance["warnings"].append("Dividend constraint requested but no dividend_yield column found.")
+
+    # 3) Sector exclusions and sector cap (requires a sector column)
+    sector_col = None
+    for c in df.columns:
+        if str(c).lower() in {"sector", "gics_sector"}:
+            sector_col = c
+            break
+
+    if constraints.exclude_sectors:
+        if sector_col is None:
+            compliance["warnings"].append("exclude_sectors requested but no sector column found.")
+        else:
+            excluded_set = {_normalize_sector(s) for s in (constraints.exclude_sectors or [])}
+            keep = df[sector_col].astype(str).map(_normalize_sector).apply(lambda x: x not in excluded_set)
+            excluded = df.loc[~keep].index.tolist()
+            for t in excluded:
+                compliance["excluded"].append({"ticker": t, "reason": "excluded_sector", "value": str(df.loc[t, sector_col])})
+            df = df.loc[keep]
+
+    # Soft sector cap: if we have sector info, we drop lowest-scored names from overrepresented sectors
+    if constraints.max_sector_fraction_in_top is not None and sector_col is not None:
+        frac = float(constraints.max_sector_fraction_in_top)
+        if 0 < frac < 1:
+            top = df.head(top_n).copy()
+            max_per_sector = max(1, int(math.floor(frac * top_n)))
+            # If we don't have Final_Score, we can't apply this reliably.
+            score_col = "Final_Score" if "Final_Score" in top.columns else None
+            if score_col is None:
+                compliance["warnings"].append("Sector cap requested but Final_Score column missing; skipping sector cap.")
+            else:
+                # iteratively enforce cap
+                while True:
+                    counts = top[sector_col].value_counts(dropna=False)
+                    viol = counts[counts > max_per_sector]
+                    if len(viol) == 0:
+                        break
+                    sector_to_fix = str(viol.index[0])
+                    # drop the lowest score within that sector
+                    sector_rows = top[top[sector_col].astype(str) == sector_to_fix]
+                    drop_ticker = sector_rows.sort_values(score_col, ascending=True).index[0]
+                    compliance["excluded"].append({"ticker": drop_ticker, "reason": "sector_cap", "value": sector_to_fix})
+                    top = top.drop(index=drop_ticker)
+                # Rebuild df with adjusted top and remaining tail
+                tail = df.loc[~df.index.isin(top.index)]
+                df = pd.concat([top, tail], axis=0)
+        else:
+            compliance["warnings"].append("max_sector_fraction_in_top must be within (0,1); skipping.")
+
+    return df, compliance
+
+
 def _outputs_dir() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     out = os.path.abspath(os.path.join(here, "..", "outputs"))
@@ -59,6 +204,15 @@ def _outputs_dir() -> str:
 
 def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _git_sha() -> str | None:
+    try:
+        # Works if run from within a git repo
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
+        return out.decode("utf-8").strip()[:12]
+    except Exception:
+        return None
 
 
 def _ensure_indexed_by_ticker(df: pd.DataFrame) -> pd.DataFrame:
@@ -164,7 +318,7 @@ def run_pipeline(
     tickers: List[str],
     period: str = "12mo",
     interval: str = "1d",
-    max_news: int = 12,
+    max_news: int = 50,
     lookback_days: int = 14,
     social_max_news: int = 15,
     social_max_reddit: int = 50,
@@ -172,6 +326,8 @@ def run_pipeline(
     generate_explanations: bool = True,
     with_advanced_quant: bool = False,
     with_nlg: bool = False,
+    client_constraints: ClientConstraints | None = None,
+    advisor_top_n: int = 10,
 ) -> Dict[str, Any]:
     out_dir = _outputs_dir()
     ts = _timestamp()
@@ -220,6 +376,15 @@ def run_pipeline(
 
     ranked_world = _ensure_indexed_by_ticker(world_out.get("ranked"))
     portfolio_world = world_out.get("portfolio")
+
+    compliance = {"available": False, "reason": "no_constraints"}
+    ranked_world_constrained = ranked_world
+    if client_constraints is not None and not ranked_world.empty:
+        ranked_world_constrained, compliance = _apply_constraints_to_ranked(
+            ranked_world,
+            constraints=client_constraints,
+            top_n=advisor_top_n,
+        )
 
     # 4) Social sentiment (already includes ranking)
     social_cfg = social_picker.Config(
@@ -272,6 +437,16 @@ def run_pipeline(
     report = {
         "timestamp": ts,
         "tickers": tickers,
+        "audit": {
+            "git_sha": _git_sha(),
+            "python_version": sys.version.split()[0],
+            "platform": platform.platform(),
+            "utc_generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        "advisor": {
+            "client_constraints": compliance.get("constraints") if isinstance(compliance, dict) else None,
+            "compliance": compliance,
+        },
         "artifacts": {},
         "warnings": [],
         "driver_reports": driver_reports,
@@ -292,6 +467,11 @@ def run_pipeline(
     merged_path = os.path.join(out_dir, f"ranked_signals_rca_{ts}.csv")
     merged.to_csv(merged_path)
     report["artifacts"]["merged_rankings_csv"] = merged_path
+
+    if client_constraints is not None and isinstance(compliance, dict) and compliance.get("available"):
+        constrained_path = os.path.join(out_dir, f"ranked_signals_rca_constrained_{ts}.csv")
+        ranked_world_constrained.to_csv(constrained_path)
+        report["artifacts"]["constrained_rankings_csv"] = constrained_path
 
     report_path = os.path.join(out_dir, f"rca_pipeline_report_{ts}.json")
     with open(report_path, "w", encoding="utf-8") as f:

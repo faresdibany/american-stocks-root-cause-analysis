@@ -164,7 +164,7 @@ def run_pipeline(
     tickers: List[str],
     period: str = "12mo",
     interval: str = "1d",
-    max_news: int = 12,
+    max_news: int = 50,
     lookback_days: int = 14,
     social_max_news: int = 15,
     social_max_reddit: int = 50,

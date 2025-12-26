@@ -1558,7 +1558,6 @@ def save_report(report: DriverReport, out_dir: str) -> str:
     return out_path
 
 
-# in stock_driver_analysis.py
 def run_driver_analysis(
     ticker: str,
     start: str,
@@ -1567,24 +1566,25 @@ def run_driver_analysis(
     trend_method: str = "hp",
     sector_etf: Optional[str] = None,
     headlines_by_date: Optional[Dict[str, List[str]]] = None,
-    factor_tickers: Optional[Dict[str, str]] = None,   # <-- ADD THIS
 ) -> str:
+    """Convenience wrapper for CLI usage.
+    
+    Parameters
+    ----------
+    sector_etf : str, optional
+        If provided, will be used as factor name 'sector' for better attribution
+    headlines_by_date : dict, optional
+        Mapping of ISO date -> list of headlines for keyword extraction
+    """
     px = fetch_prices(ticker, start=start, end=end)
-
-    # Merge factor dictionaries:
-    merged = {}
-    if factor_tickers:
-        merged.update({k: v for k, v in factor_tickers.items() if v})
-    if sector_etf:
-        merged["sector"] = sector_etf
-
+    factors = {"sector": sector_etf} if sector_etf else None
     report = build_driver_report(
         ticker,
         px,
         start=start,
         end=end,
         trend_method=trend_method,
-        factor_tickers=merged if merged else None,        # <-- USE MERGED
+        factor_tickers=factors,
         headlines_by_date=headlines_by_date,
     )
     return save_report(report, out_dir=out_dir)

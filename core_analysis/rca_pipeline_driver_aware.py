@@ -1,19 +1,19 @@
-"""Root Cause Analysis (RCA) — End-to-end US pipeline
+"""Root Cause Analysis (RCA) — End-to-end pipeline (driver-aware)
 
-This script makes `american stocks root cause analysis/` an *independent* pipeline
-that chains:
+This script is an *independent* pipeline that chains:
 
-1) Historical price driver analysis (trend/regimes/jumps/changepoints + SPY event study)
-2) Quantitative ranking
-3) AI / world-news analysis
-4) Social sentiment (news + Reddit + StockTwits best-effort)
-5) One consolidated report output
+1) Driver discovery (outcome-driven: market/sector/macro vs idiosyncratic)
+2) Historical price driver analysis (trend/regimes/jumps/changepoints + factor attribution)
+3) Quant + AI / world-news ranking
+4) Social sentiment ranking (news + Reddit + StockTwits best-effort)
+5) Mode-aware consolidation: ranking + explanations that respect driver modes
 
 Design goals
 ------------
-- Keep dependencies optional wherever possible (same style as the other pickers).
-- Avoid tight coupling: we call existing modules and collect their outputs.
-- Always write artifacts under `../outputs/`.
+- Keep dependencies optional wherever possible (same style as other pickers).
+- Avoid tight coupling: call existing modules and collect their outputs.
+- Always write artifacts under ./outputs/.
+- Work best-effort for any ticker (including non-US), with robust fallbacks.
 
 Usage
 -----
@@ -27,6 +27,7 @@ Notes
 -----
 - Social sentiment may require API keys for Reddit (PRAW). StockTwits often blocks
   automated requests; the social script already degrades gracefully.
+- This is not investment advice.
 """
 
 from __future__ import annotations
@@ -35,8 +36,9 @@ import argparse
 import json
 import os
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
+import numpy as np
 import pandas as pd
 
 # Local imports (same folder)
@@ -46,12 +48,20 @@ from stock_driver_analysis import run_driver_analysis
 import stock_picker_hybrid_world_news_extension as world_news_picker
 import stock_picker_social_sentiment as social_picker
 
-# Optional: deep NLG (advanced quant script). We import lazily inside run_pipeline
-# to avoid heavy imports (statsmodels/arch/talib/transformers/sklearn) unless requested.
+# Optional driver discovery (new; best-effort)
+try:
+    from driver_discovery import discover_driver_profile  # type: ignore
+except Exception:  # pragma: no cover
+    discover_driver_profile = None  # type: ignore
 
+
+# -----------------------------
+# Helpers
+# -----------------------------
 
 def _outputs_dir() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
+    # Repo-level outputs folder (consistent with other pipelines)
     out = os.path.abspath(os.path.join(here, "..", "outputs"))
     os.makedirs(out, exist_ok=True)
     return out
@@ -102,44 +112,15 @@ def _summarize_driver_report(rep: Dict[str, Any]) -> str:
     if isinstance(vols, list) and vols:
         labels = [v.get("label") for v in vols if isinstance(v, dict) and v.get("label")]
         if labels:
-            # majority label
-            maj = max(set(labels), key=labels.count)
-            parts.append(f"Volatility regime mostly: {maj}")
+            parts.append("Vol regime(s): " + ", ".join(sorted(set(labels))))
 
     # Jumps
     jumps = rep.get("jumps") or []
     if isinstance(jumps, list) and jumps:
-        parts.append(f"Jumps detected: {len(jumps)}")
-        # Mention top 1–2 jumps
-        top = jumps[:2]
-        det = []
-        for j in top:
-            if not isinstance(j, dict):
-                continue
-            d = j.get("date")
-            r = j.get("ret")
-            try:
-                det.append(f"{d} ({float(r)*100:.1f}%)")
-            except Exception:
-                det.append(str(d))
-        if det:
-            parts.append("Top moves: " + ", ".join(det))
-
-    # Abnormal return attribution
-    ar = (rep.get("event_attribution") or {}).get("abnormal_returns") or {}
-    if isinstance(ar, dict) and ar.get("available"):
         try:
-            beta = float(ar.get("beta"))
-            parts.append(f"Beta vs {ar.get('benchmark','SPY')}: {beta:.2f}")
+            parts.append(f"Jumps: {len(jumps)} (max |ret| {max(abs(float(j.get('ret', 0.0))) for j in jumps)*100:.1f}%)")
         except Exception:
-            pass
-        summ = ar.get("summary") or {}
-        try:
-            frac = float(summ.get("mean_abs_abnormal_fraction"))
-            if pd.notna(frac):
-                parts.append(f"Mean abs abnormal fraction on jumps: {frac:.2f}")
-        except Exception:
-            pass
+            parts.append(f"Jumps: {len(jumps)}")
 
     # Change points
     cps = rep.get("change_points") or {}
@@ -157,8 +138,165 @@ def _summarize_driver_report(rep: Dict[str, Any]) -> str:
                 det.append(str(d))
         parts.append("Change points: " + ", ".join(det))
 
+    # Factor model availability
+    fm = rep.get("factor_model") or {}
+    if isinstance(fm, dict) and fm.get("available"):
+        r2 = fm.get("r2")
+        try:
+            parts.append(f"Factor R²: {float(r2):.2f}")
+        except Exception:
+            pass
+
     return "; ".join(parts) if parts else "No strong driver signals extracted."
 
+
+def _minmax(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    if s.dropna().empty:
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    lo = float(np.nanmin(s.values))
+    hi = float(np.nanmax(s.values))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo <= 1e-12:
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    return (s - lo) / (hi - lo)
+
+
+def _mode_weights(mode: str) -> Dict[str, float]:
+    """
+    Mode-aware interpretation weights:
+      - beta_or_sector_driven: trust quant (CAGR/Sharpe); sentiment secondary
+      - narrative_or_idiosyncratic: sentiment/topic matter more; penalize jump risk
+      - rates_sensitive: emphasize Sharpe; penalize rate exposure
+      - commodity_oil_sensitive: emphasize Sharpe; penalize oil exposure
+      - mixed: balanced
+    """
+    mode = (mode or "mixed").strip()
+    if mode == "beta_or_sector_driven":
+        return {"CAGR": 0.45, "Sharpe": 0.40, "Sent": 0.10, "Topic": 0.05}
+    if mode == "narrative_or_idiosyncratic":
+        return {"CAGR": 0.20, "Sharpe": 0.25, "Sent": 0.35, "Topic": 0.20}
+    if mode == "rates_sensitive":
+        return {"CAGR": 0.30, "Sharpe": 0.50, "Sent": 0.15, "Topic": 0.05}
+    if mode == "commodity_oil_sensitive":
+        return {"CAGR": 0.35, "Sharpe": 0.45, "Sent": 0.15, "Topic": 0.05}
+    return {"CAGR": 0.35, "Sharpe": 0.35, "Sent": 0.20, "Topic": 0.10}
+
+
+def apply_driver_mode_ranking(
+    merged: pd.DataFrame,
+    driver_profiles: Dict[str, Dict[str, Any]],
+    driver_reports_json: Dict[str, Dict[str, Any]],
+) -> pd.DataFrame:
+    """
+    Adds:
+      - driver_mode
+      - driver_market_like_share
+      - ModeAwareScore
+    and sorts by ModeAwareScore desc.
+
+    Assumes merged contains some of: CAGR, Sharpe, CombinedSentiment, TopicMomentum.
+    """
+    if merged is None or merged.empty:
+        return merged
+
+    df = merged.copy()
+
+    # Normalized components (safe defaults)
+    df["CAGR_n"] = _minmax(df["CAGR"]) if "CAGR" in df.columns else 0.0
+    df["Sharpe_n"] = _minmax(df["Sharpe"]) if "Sharpe" in df.columns else 0.0
+
+    # sentiment + topic can exist in either base or social-prefixed versions
+    if "CombinedSentiment" in df.columns:
+        df["Sent_n"] = _minmax(df["CombinedSentiment"])
+    elif "social_CombinedSentiment" in df.columns:
+        df["Sent_n"] = _minmax(df["social_CombinedSentiment"])
+    else:
+        df["Sent_n"] = 0.0
+
+    if "TopicMomentum" in df.columns:
+        df["Topic_n"] = _minmax(df["TopicMomentum"])
+    elif "social_TopicMomentum" in df.columns:
+        df["Topic_n"] = _minmax(df["social_TopicMomentum"])
+    else:
+        df["Topic_n"] = 0.0
+
+    # Attach driver mode + market-like share
+    modes = {}
+    mkt_like = {}
+    for t in df.index:
+        prof = (driver_profiles or {}).get(t, {}) or {}
+        modes[t] = prof.get("mode", "mixed")
+        mkt_like[t] = prof.get("market_like_share", np.nan)
+    df["driver_mode"] = pd.Series(modes)
+    df["driver_market_like_share"] = pd.Series(mkt_like)
+
+    # Risk penalties (best-effort)
+    jump_pen = pd.Series(0.0, index=df.index)
+    rates_pen = pd.Series(0.0, index=df.index)
+    oil_pen = pd.Series(0.0, index=df.index)
+
+    for t in df.index:
+        rep = (driver_reports_json or {}).get(t, {}) or {}
+        per_jump = rep.get("per_jump_drivers") or []
+        fm = rep.get("factor_model") or {}
+        betas = fm.get("betas") if isinstance(fm, dict) else None
+
+        # simple jump proxy: more jump days => more gap risk
+        if isinstance(per_jump, list) and len(per_jump) > 0:
+            jump_pen[t] = min(0.25, 0.03 * len(per_jump))
+
+        # penalties depend on factor naming (your driver report uses tickers as factor labels; keep defensive)
+        if isinstance(betas, dict):
+            # try a few likely keys
+            rb = 0.0
+            for k in ["rates", "TLT", "IEF", "rates_long", "rates_intermediate"]:
+                if k in betas:
+                    try:
+                        rb = max(rb, abs(float(betas.get(k, 0.0))))
+                    except Exception:
+                        pass
+            ob = 0.0
+            for k in ["oil", "USO"]:
+                if k in betas:
+                    try:
+                        ob = max(ob, abs(float(betas.get(k, 0.0))))
+                    except Exception:
+                        pass
+            rates_pen[t] = min(0.25, 0.05 * rb)
+            oil_pen[t] = min(0.25, 0.05 * ob)
+
+    # Compute ModeAwareScore
+    scores = []
+    for t in df.index:
+        mode = str(df.loc[t, "driver_mode"] or "mixed")
+        w = _mode_weights(mode)
+
+        base = (
+            w["CAGR"] * float(df.loc[t, "CAGR_n"]) +
+            w["Sharpe"] * float(df.loc[t, "Sharpe_n"]) +
+            w["Sent"] * float(df.loc[t, "Sent_n"]) +
+            w["Topic"] * float(df.loc[t, "Topic_n"])
+        )
+
+        # Apply penalties by mode
+        if mode == "narrative_or_idiosyncratic":
+            base -= float(jump_pen[t])
+        elif mode == "rates_sensitive":
+            base -= float(rates_pen[t])
+        elif mode == "commodity_oil_sensitive":
+            base -= float(oil_pen[t])
+
+        scores.append(base)
+
+    df["ModeAwareScore"] = pd.Series(scores, index=df.index)
+    df = df.sort_values("ModeAwareScore", ascending=False)
+
+    return df
+
+
+# -----------------------------
+# Pipeline
+# -----------------------------
 
 def run_pipeline(
     tickers: List[str],
@@ -193,18 +331,55 @@ def run_pipeline(
     start_s = start.strftime("%Y-%m-%d")
     end_s = end.strftime("%Y-%m-%d")
 
-    # 1) Driver analysis (per ticker)
+    # 1) Driver discovery + driver analysis (per ticker)
     driver_reports: Dict[str, Any] = {}
+    driver_reports_json: Dict[str, Dict[str, Any]] = {}
+    driver_profiles: Dict[str, Dict[str, Any]] = {}
+
     for t in tickers:
+        prof: Dict[str, Any] = {}
+        if callable(discover_driver_profile):
+            try:
+                prof = discover_driver_profile(ticker=t, start=start_s, end=end_s)  # type: ignore
+            except Exception:
+                prof = {}
+        driver_profiles[t] = prof
+
+        sector_proxy = None
+        factor_dict = None
+        if isinstance(prof, dict):
+            sel = prof.get("selected") or {}
+            if isinstance(sel, dict):
+                sector_proxy = sel.get("sector_proxy")
+            factor_dict = prof.get("factor_tickers")
+
         # Driver analysis module writes a JSON file and returns its path.
-        out_path = run_driver_analysis(
-            ticker=t,
-            start=start_s,
-            end=end_s,
-            out_dir=out_dir,
-            trend_method="hp",
-        )
-        driver_reports[t] = {"report_path": out_path}
+        # We try to pass factor_tickers if the underlying function supports it.
+        try:
+            out_path = run_driver_analysis(
+                ticker=t,
+                start=start_s,
+                end=end_s,
+                out_dir=out_dir,
+                trend_method="hp",
+                sector_etf=sector_proxy,
+                factor_tickers=factor_dict,   # may raise TypeError on older versions
+                headlines_by_date=None,
+            )
+        except TypeError:
+            out_path = run_driver_analysis(
+                ticker=t,
+                start=start_s,
+                end=end_s,
+                out_dir=out_dir,
+                trend_method="hp",
+                sector_etf=sector_proxy,
+                headlines_by_date=None,
+            )
+
+        driver_reports[t] = {"report_path": out_path, "driver_profile": prof}
+        rep = _safe_read_json(out_path)
+        driver_reports_json[t] = rep
 
     # 2+3) Quant + AI/world news picker (already includes ranking)
     world_cfg = world_news_picker.Config(
@@ -217,7 +392,6 @@ def run_pipeline(
         lookback_days=lookback_days,
     )
     world_out = world_news_picker.run(world_cfg)
-
     ranked_world = _ensure_indexed_by_ticker(world_out.get("ranked"))
     portfolio_world = world_out.get("portfolio")
 
@@ -234,12 +408,12 @@ def run_pipeline(
         source_weights={"news": 0.5, "reddit": 0.5, "stocktwits": 0.0},
     )
     social_out = social_picker.run(social_cfg)
-
     ranked_social = _ensure_indexed_by_ticker(social_out.get("ranked"))
     portfolio_social = social_out.get("portfolio")
 
-    # 5) Merge + explain
+    # 5) Merge
     merged = ranked_world.copy() if not ranked_world.empty else pd.DataFrame(index=tickers)
+
     if not ranked_social.empty:
         # bring in social columns with prefixes to avoid collisions
         for col in ranked_social.columns:
@@ -248,25 +422,31 @@ def run_pipeline(
             else:
                 merged[col] = ranked_social[col]
 
-    # Add a simple driver-based narrative tag
-    driver_tags = {}
-    for t, rep in driver_reports.items():
-        jumps = (rep.get("jumps") or []) if isinstance(rep, dict) else []
-        cps = (rep.get("change_points") or []) if isinstance(rep, dict) else []
+    # Add driver tags based on the *actual* JSON contents (fixes previous bug)
+    driver_tags: Dict[str, str] = {}
+    for t in tickers:
+        rep = driver_reports_json.get(t, {}) or {}
+        jumps = rep.get("jumps") or []
+        cps = rep.get("change_points") or {}
+        pts = cps.get("points") if isinstance(cps, dict) else None
+
         tag = "stable"
-        if jumps and len(jumps) >= 2:
+        if isinstance(jumps, list) and len(jumps) >= 2:
             tag = "jump-driven"
-        if cps and len(cps) >= 2:
+        if isinstance(pts, list) and len(pts) >= 2:
             tag = "regime-shift"
-        if jumps and cps:
+        if isinstance(jumps, list) and jumps and isinstance(pts, list) and pts:
             tag = "events+regimes"
         driver_tags[t] = tag
 
     merged["driver_tag"] = pd.Series(driver_tags)
 
-    # Final score: prefer world picker Final_Score, else fallback to what exists
-    if "Final_Score" in merged.columns:
-        merged = merged.sort_values("Final_Score", ascending=False)
+    # Mode-aware ranking (replacement for Final_Score sorting)
+    merged = apply_driver_mode_ranking(
+        merged=merged,
+        driver_profiles=driver_profiles,
+        driver_reports_json=driver_reports_json,
+    )
 
     # Write artifacts
     report = {
@@ -274,7 +454,9 @@ def run_pipeline(
         "tickers": tickers,
         "artifacts": {},
         "warnings": [],
-        "driver_reports": driver_reports,
+        "driver_reports": driver_reports,          # contains report_path + driver_profile
+        "driver_reports_json": driver_reports_json, # full parsed JSON reports (useful for downstream)
+        "driver_profiles": driver_profiles,
         "world_news": {
             "weights": world_out.get("weights"),
             "backtest": world_out.get("backtest"),
@@ -342,7 +524,7 @@ def run_pipeline(
                 ai_signals_adv.to_csv(p)
                 report["artifacts"]["ai_signals_adv_quant_csv"] = p
 
-            # Update the JSON report on disk to include advanced-quant artifacts.
+            # Update JSON report on disk to include advanced-quant artifacts.
             with open(report_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
         except Exception as e:
@@ -353,11 +535,13 @@ def run_pipeline(
             except Exception:
                 pass
 
-    # Optional: run the deep NLG pipeline and save its outputs into outputs/.
+    # Optional: NLG stage (existing module)
     if with_nlg:
         try:
             import stock_picker_nlg_explanations as nlg  # local module
 
+            # Use the advisor-style entrypoint which generates explanations and
+            # returns the richer result dict (run_with_explanations).
             nlg_cfg = nlg.Config(
                 tickers=tickers,
                 period=period,
@@ -369,9 +553,13 @@ def run_pipeline(
                 generate_explanations=True,
                 explanations_top_n=min(10, len(tickers)),
             )
-            nlg_out = nlg.run_with_explanations(nlg_cfg)
+            # call the explicit run_with_explanations entrypoint (module defines this)
+            if hasattr(nlg, "run_with_explanations"):
+                nlg_out = nlg.run_with_explanations(nlg_cfg)
+            else:
+                # fallback for older modules that may export `run` (defensive)
+                nlg_out = getattr(nlg, "run", lambda cfg: {}) (nlg_cfg)
 
-            # Save to outputs/ (no nlg_analysis_* directories).
             ranked_nlg = nlg_out.get("ranked")
             portfolio_nlg = nlg_out.get("portfolio")
             fundamentals_nlg = nlg_out.get("fundamentals")
@@ -416,30 +604,57 @@ def run_pipeline(
                 pass
 
     # Optional: write a human-readable narrative file.
-    # This is intentionally dependency-light and complements `stock_picker_nlg_explanations.py`.
     if generate_explanations:
         expl_path = os.path.join(out_dir, f"explanations_rca_{ts}.md")
         with open(expl_path, "w", encoding="utf-8") as f:
-            f.write(f"# RCA Pipeline Explanations\n\n")
+            f.write(f"# RCA Pipeline Explanations (driver-aware)\n\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             f.write(f"Tickers: {', '.join(tickers)}\n\n")
 
             # Pull a few useful columns if present
-            world_cols = [c for c in ["Final_Score", "CAGR", "Sharpe", "CombinedSentiment", "TopicMomentum"] if c in ranked_world.columns]
+            world_cols = [c for c in ["CAGR", "Sharpe", "CombinedSentiment", "TopicMomentum"] if c in ranked_world.columns]
             social_cols = [c for c in ["CombinedSentiment", "TopicMomentum", "TotalMentions", "NewsCount", "RedditCount", "StockTwitsCount"] if c in ranked_social.columns]
 
             for rank, t in enumerate(list(merged.index), 1):
                 f.write(f"## #{rank} — {t}\n\n")
+                if "ModeAwareScore" in merged.columns:
+                    try:
+                        f.write(f"**ModeAwareScore:** {float(merged.loc[t, 'ModeAwareScore']):.3f}\n\n")
+                    except Exception:
+                        pass
 
-                # Driver summary (we currently store just the JSON path)
+                # Driver mode block (from discovery)
+                prof = driver_profiles.get(t, {}) or {}
+                mode = prof.get("mode", "mixed")
+                mls = prof.get("market_like_share", None)
+
+                f.write(f"**Driver mode:** `{mode}`\n\n")
+                if mls is not None:
+                    try:
+                        f.write(f"- Market-like share (discovery): {float(mls):.2f}\n")
+                    except Exception:
+                        pass
+                sel = prof.get("selected") if isinstance(prof, dict) else None
+                if isinstance(sel, dict):
+                    if sel.get("market_proxy"):
+                        f.write(f"- Market proxy: {sel.get('market_proxy')}\n")
+                    if sel.get("sector_proxy"):
+                        f.write(f"- Sector proxy: {sel.get('sector_proxy')}\n")
+                checklist = prof.get("analysis_checklist") if isinstance(prof, dict) else None
+                if isinstance(checklist, list) and checklist:
+                    f.write("\n**How to interpret signals for this stock:**\n\n")
+                    for it in checklist[:5]:
+                        f.write(f"- {it}\n")
+                f.write("\n")
+
+                # Driver summary (actual driver report JSON)
+                rep = driver_reports_json.get(t, {}) or {}
+                f.write(f"**Driver analysis tag:** {merged.loc[t, 'driver_tag'] if 'driver_tag' in merged.columns else 'n/a'}\n\n")
                 d = driver_reports.get(t, {})
-                f.write(f"**Driver analysis:** {merged.loc[t, 'driver_tag'] if 'driver_tag' in merged.columns else 'n/a'}\n\n")
                 if isinstance(d, dict) and d.get("report_path"):
                     f.write(f"- Driver report: `{d['report_path']}`\n")
-
-                    rep = _safe_read_json(d["report_path"])
-                    if rep:
-                        f.write(f"- Driver highlights: {_summarize_driver_report(rep)}\n")
+                if rep:
+                    f.write(f"- Driver highlights: {_summarize_driver_report(rep)}\n")
 
                 # World-news ranking summary
                 if t in ranked_world.index and world_cols:
@@ -461,38 +676,15 @@ def run_pipeline(
                         except Exception:
                             f.write(f"- {c}: {s2[c]}\n")
 
-                # Simple narrative paragraph
-                ws = None
-                ss = None
-                try:
-                    ws = float(ranked_world.loc[t, "CombinedSentiment"]) if t in ranked_world.index and "CombinedSentiment" in ranked_world.columns else None
-                except Exception:
-                    ws = None
-                try:
-                    ss = float(ranked_social.loc[t, "CombinedSentiment"]) if t in ranked_social.index and "CombinedSentiment" in ranked_social.columns else None
-                except Exception:
-                    ss = None
-
-                narrative = []
-                tag = merged.loc[t, "driver_tag"] if "driver_tag" in merged.columns else "stable"
-                if tag == "events+regimes":
-                    narrative.append("Price action looks like a mix of event shocks and regime changes (not pure noise).")
-                elif tag == "regime-shift":
-                    narrative.append("The stock shows regime-change signatures (volatility/trend shifts) rather than steady drift.")
-                elif tag == "jump-driven":
-                    narrative.append("Large single-day moves (jumps) appear to be a key driver of returns.")
-                else:
-                    narrative.append("No strong jump/regime flags; movement looks comparatively stable in this window.")
-
-                if ws is not None and abs(ws) >= 0.10:
-                    narrative.append(f"News sentiment is {'positive' if ws > 0 else 'negative'} (world+company combined).")
-                if ss is not None and abs(ss) >= 0.05:
-                    narrative.append(f"Crowd/social tone is {'positive' if ss > 0 else 'negative'} (best-effort sources).")
-
-                f.write("\n**Summary:** ")
-                f.write(" ".join(narrative) + "\n\n")
+                f.write("\n---\n\n")
 
         report["artifacts"]["explanations_md"] = expl_path
+        # Update the JSON report on disk to include explanations artifact.
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+        except Exception:
+            pass
 
     return {"report": report, "merged": merged}
 
@@ -522,9 +714,9 @@ def main() -> None:
     )
 
     merged = out["merged"]
-    print("\n=== RCA PIPELINE COMPLETE ===")
+    print("\n=== RCA PIPELINE COMPLETE (driver-aware) ===")
     print("Top 10:")
-    cols = [c for c in ["Final_Score", "CAGR", "Sharpe", "CombinedSentiment", "TopicMomentum", "driver_tag"] if c in merged.columns]
+    cols = [c for c in ["ModeAwareScore", "Final_Score", "CAGR", "Sharpe", "CombinedSentiment", "TopicMomentum", "driver_mode", "driver_tag"] if c in merged.columns]
     print(merged[cols].head(10))
 
 
